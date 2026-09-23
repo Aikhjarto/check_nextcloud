@@ -7,11 +7,14 @@
 
 import argparse
 import base64
+import fcntl
 import json
 import os
 import socket
 import ssl
+import stat
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -23,7 +26,7 @@ UNKNOWN = 3
 
 STATE_TEXT = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
 
-VERSION = "0.1"
+VERSION = "0.2"
 DEFAULT_PORT = 443
 DEFAULT_USER = "admin"
 DEFAULT_TIMEOUT = 10
@@ -142,14 +145,14 @@ def read_password(args):
     raise PluginError(UNKNOWN, "no app password given, use -P, -f or $NEXTCLOUD_APP_PASSWORD")
 
 
-def http_get(args, path, authenticate=False):
+def http_request(args, path, password=None, method="GET"):
     scheme = "https" if args.ssl else "http"
     url = "%s://%s:%d%s" % (scheme, args.hostname, args.port, path)
 
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    if authenticate:
+    request = urllib.request.Request(url, headers={"Accept": "application/json"}, method=method)
+    if password is not None:
         request.add_header("OCS-APIRequest", "true")
-        credentials = "%s:%s" % (args.username, read_password(args))
+        credentials = "%s:%s" % (args.username, password)
         encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
         request.add_header("Authorization", "Basic %s" % encoded)
 
@@ -161,9 +164,17 @@ def http_get(args, path, authenticate=False):
             context.verify_mode = ssl.CERT_NONE
 
     started = time.monotonic()
+    with urllib.request.urlopen(request, timeout=args.timeout, context=context) as response:
+        body = response.read()
+    return json.loads(body.decode("utf-8")), time.monotonic() - started
+
+
+def http_get(args, path, authenticate=False, password=None):
+    url = "%s://%s:%d%s" % ("https" if args.ssl else "http", args.hostname, args.port, path)
+    if authenticate and password is None:
+        password = read_password(args)
     try:
-        with urllib.request.urlopen(request, timeout=args.timeout, context=context) as response:
-            body = response.read()
+        return http_request(args, path, password)
     except urllib.error.HTTPError as err:
         if err.code in (401, 403):
             raise PluginError(UNKNOWN, "credentials rejected for %s (HTTP %d)" % (path, err.code))
@@ -174,10 +185,6 @@ def http_get(args, path, authenticate=False):
         raise PluginError(CRITICAL, "cannot reach %s: %s" % (url, err.reason))
     except socket.timeout:
         raise PluginError(CRITICAL, "timeout after %gs while reading %s" % (args.timeout, url))
-    elapsed = time.monotonic() - started
-
-    try:
-        return json.loads(body.decode("utf-8")), elapsed
     except (UnicodeDecodeError, ValueError):
         raise PluginError(UNKNOWN, "no valid JSON returned by %s, is this a Nextcloud server?" % path)
 
@@ -217,6 +224,73 @@ def evaluate(args, value):
     if args.warning and args.warning.breached(value):
         return WARNING
     return OK
+
+
+class TokenFile:
+    """Token file that can be replaced safely while other checks read it."""
+
+    def __init__(self, path):
+        self.path = os.path.realpath(os.path.expanduser(path))
+        self.directory = os.path.dirname(self.path)
+        self.lock = None
+        self.pending = None
+
+    def __enter__(self):
+        try:
+            self.lock = open(self.path + ".lock", "a")
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise PluginError(UNKNOWN, "another rotation of %s is running" % self.path)
+        except OSError as err:
+            raise PluginError(UNKNOWN, "cannot lock %s: %s" % (self.path, err))
+        return self
+
+    def __exit__(self, *exc):
+        self.discard()
+        self.lock.close()
+
+    def read(self):
+        try:
+            with open(self.path, "r") as handle:
+                return handle.read().strip()
+        except OSError as err:
+            raise PluginError(UNKNOWN, "cannot read token file: %s" % err)
+
+    def prepare(self):
+        """Runs before the rotation request, so a file that cannot be stored stops it."""
+        try:
+            info = os.stat(self.path)
+            fd, name = tempfile.mkstemp(prefix=".%s." % os.path.basename(self.path), dir=self.directory)
+        except OSError as err:
+            raise PluginError(UNKNOWN, "cannot create a replacement for %s: %s" % (self.path, err))
+        self.pending = (fd, name)
+        try:
+            os.fchown(fd, info.st_uid, info.st_gid)
+            os.fchmod(fd, stat.S_IMODE(info.st_mode))
+        except OSError as err:
+            raise PluginError(UNKNOWN, "cannot keep owner and mode of %s (%s), rotate as its owner or as root"
+                                       % (self.path, err))
+
+    def commit(self, secret):
+        fd, name = self.pending
+        self.pending = None
+        with os.fdopen(fd, "w") as handle:
+            handle.write(secret)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, self.path)
+        directory = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def discard(self):
+        if self.pending:
+            fd, name = self.pending
+            self.pending = None
+            os.close(fd)
+            os.unlink(name)
 
 
 def check_health(args):
@@ -361,6 +435,52 @@ def check_apps(args):
     return state, message, perf
 
 
+USER_PATH = "/ocs/v2.php/cloud/user?format=json"
+ROTATE_PATH = "/ocs/v2.php/core/apppassword/rotate?format=json"
+
+
+def rotate(args):
+    path = args.password_file or os.environ.get("NEXTCLOUD_APP_PASSWORD_FILE")
+    if not path:
+        raise PluginError(UNKNOWN, "rotation writes the new app password back, give the password file with -f "
+                                   "or $NEXTCLOUD_APP_PASSWORD_FILE")
+
+    with TokenFile(path) as password_file:
+        password = password_file.read()
+        http_get(args, USER_PATH, password=password)
+
+        password_file.prepare()
+        try:
+            answer, _ = http_request(args, ROTATE_PATH, password, "POST")
+            new_password = answer["ocs"]["data"]["apppassword"]
+        except urllib.error.HTTPError as err:
+            if err.code < 500:
+                raise PluginError(UNKNOWN, "Nextcloud refused the rotation with HTTP %d, the stored password is "
+                                           "unchanged and still valid; only app passwords can be rotated"
+                                           % err.code)
+            raise PluginError(CRITICAL, uncertain_rotation("HTTP %d" % err.code))
+        except (OSError, ValueError, KeyError, TypeError) as err:
+            raise PluginError(CRITICAL, uncertain_rotation(err))
+
+        try:
+            password_file.commit(new_password)
+        except OSError as err:
+            raise PluginError(CRITICAL, "Nextcloud rotated the app password, but storing the new one failed (%s); "
+                                        "the old one is invalid, create a new one" % err)
+
+    try:
+        http_get(args, USER_PATH, password=new_password)
+    except PluginError as err:
+        raise PluginError(CRITICAL, "stored the rotated app password, but it does not work: %s" % err.message)
+
+    return OK, "rotated the app password of user %r" % args.username, []
+
+
+def uncertain_rotation(reason):
+    return ("rotation request failed (%s) and Nextcloud may have processed it anyway; the stored app password "
+            "is unchanged, if it is rejected now, create a new one" % reason)
+
+
 MODES = {
     "health": (check_health, "check status.php for an installed and running instance", float, None, None),
     "cpu": (check_cpu, "check the load average of the server", float, None, None),
@@ -379,22 +499,23 @@ def build_parser():
     )
     parser.add_argument("-V", "--version", action="version", version="check_nextcloud %s" % VERSION)
 
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("-H", "--hostname", required=True, help="host name or address of the Nextcloud server")
-    common.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
+    connection = argparse.ArgumentParser(add_help=False)
+    connection.add_argument("-H", "--hostname", required=True, help="host name or address of the Nextcloud server")
+    connection.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
                         help="port of the Nextcloud server (default: %d)" % DEFAULT_PORT)
-    common.add_argument("-S", "--ssl", dest="ssl", action="store_true", default=True,
+    connection.add_argument("-S", "--ssl", dest="ssl", action="store_true", default=True,
                         help="use HTTPS (default)")
-    common.add_argument("--no-ssl", dest="ssl", action="store_false", help="use plain HTTP")
-    common.add_argument("-k", "--insecure", action="store_true", help="do not verify the TLS certificate")
-    common.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT,
+    connection.add_argument("--no-ssl", dest="ssl", action="store_false", help="use plain HTTP")
+    connection.add_argument("-k", "--insecure", action="store_true", help="do not verify the TLS certificate")
+    connection.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help="timeout in seconds (default: %d)" % DEFAULT_TIMEOUT)
-    common.add_argument("-u", "--username", default=DEFAULT_USER,
+    connection.add_argument("-u", "--username", default=DEFAULT_USER,
                         help="user the app password belongs to (default: %s)" % DEFAULT_USER)
-    common.add_argument("-P", "--password", help="app password; visible in the process list, prefer -f")
-    common.add_argument("-f", "--password-file", help="file holding the app password")
-    common.add_argument("-w", "--warning", help="warning threshold as a range")
-    common.add_argument("-c", "--critical", help="critical threshold as a range")
+    check = argparse.ArgumentParser(add_help=False)
+    check.add_argument("-P", "--password", help="app password; visible in the process list, prefer -f")
+    check.add_argument("-f", "--password-file", help="file holding the app password")
+    check.add_argument("-w", "--warning", help="warning threshold as a range")
+    check.add_argument("-c", "--critical", help="critical threshold as a range")
 
     subparsers = parser.add_subparsers(dest="mode", required=True, metavar="MODE")
     for name, (_, description, _, warning, critical) in sorted(MODES.items()):
@@ -406,21 +527,28 @@ def build_parser():
         help_text = description
         if defaults:
             help_text += " (defaults to %s)" % " ".join(defaults)
-        subparsers.add_parser(name, parents=[common], help=help_text, description=help_text)
+        subparsers.add_parser(name, parents=[connection, check], help=help_text, description=help_text)
+
+    help_text = "rotate the app password and store the new one"
+    rotation = subparsers.add_parser("rotate", parents=[connection], help=help_text, description=help_text)
+    rotation.add_argument("-f", "--password-file", help="file holding the app password, the new one replaces it")
 
     return parser
 
 
 def main():
     args = build_parser().parse_args()
-    handler, _, parse_value, default_warning, default_critical = MODES[args.mode]
-    warning = args.warning if args.warning is not None else default_warning
-    critical = args.critical if args.critical is not None else default_critical
 
     try:
-        args.warning = Range.parse(warning, parse_value) if warning else None
-        args.critical = Range.parse(critical, parse_value) if critical else None
-        state, message, perf = handler(args)
+        if args.mode == "rotate":
+            state, message, perf = rotate(args)
+        else:
+            handler, _, parse_value, default_warning, default_critical = MODES[args.mode]
+            warning = args.warning if args.warning is not None else default_warning
+            critical = args.critical if args.critical is not None else default_critical
+            args.warning = Range.parse(warning, parse_value) if warning else None
+            args.critical = Range.parse(critical, parse_value) if critical else None
+            state, message, perf = handler(args)
     except (KeyError, TypeError, ValueError, IndexError) as err:
         print("NEXTCLOUD %s UNKNOWN - unexpected answer from the server: %r" % (args.mode.upper(), err))
         return UNKNOWN
@@ -428,7 +556,10 @@ def main():
         print("NEXTCLOUD %s %s - %s" % (args.mode.upper(), STATE_TEXT[err.state], err.message))
         return err.state
 
-    print("NEXTCLOUD %s %s - %s | %s" % (args.mode.upper(), STATE_TEXT[state], message, " ".join(perf)))
+    output = "NEXTCLOUD %s %s - %s" % (args.mode.upper(), STATE_TEXT[state], message)
+    if perf:
+        output += " | " + " ".join(perf)
+    print(output)
     return state
 
 

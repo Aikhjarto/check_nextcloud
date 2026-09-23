@@ -15,6 +15,9 @@ which ships with Nextcloud and has to be enabled.
 | `users` | How many users were active recently? | none |
 | `apps` | How many apps have an update available? | `-w 0` |
 
+`rotate` is not a check: it replaces the app password, see
+[App password rotation](#app-password-rotation).
+
 ## Usage
 
 ```sh
@@ -50,6 +53,52 @@ The password is taken from, in this order:
 2. `-f` / `--password-file`
 3. `$NEXTCLOUD_APP_PASSWORD_FILE`
 4. `$NEXTCLOUD_APP_PASSWORD`
+
+## App password rotation
+
+`check_nextcloud rotate` replaces the app password and writes the new one back
+into the password file:
+
+```sh
+check_nextcloud rotate -H cloud.example.com -f /etc/icinga2/nextcloud.secret
+```
+
+Nextcloud app passwords do not expire, so every run rotates and the cron
+schedule decides how often. Only app passwords can be rotated, not login
+passwords. The new password is 72 characters long instead of the
+`xxxxx-xxxxx-xxxxx-xxxxx-xxxxx` format, which is expected.
+
+Run it from cron as the owner of the password file or as root, not as a check
+of the monitoring system, for example weekly:
+
+```
+# /etc/cron.d/check_nextcloud-rotate
+17 3 * * 0 root chronic /usr/lib/nagios/plugins/check_nextcloud rotate -H cloud.example.com -f /etc/icinga2/nextcloud.secret
+```
+
+`chronic` from moreutils keeps cron quiet unless a run fails. If a rotation
+leaves a broken app password behind, every check except `health` reports it as
+UNKNOWN.
+
+How the rotation stays safe:
+
+- A lock file next to the credential (`<file>.lock`) makes sure only one
+  rotation runs at a time. The directory has to be writable for it and for the
+  replacement file.
+- The replacement file is created with the owner and mode of the old one
+  before anything is sent to the server, then written, synced and renamed over
+  the old file. Checks read either the old or the new app password, never a
+  half-written one; a check that read the old one just before the switch may
+  report UNKNOWN once.
+- A failed rotation is never retried. When it is unclear whether the server
+  rotated (timeout, server error), `rotate` exits CRITICAL and leaves the file
+  alone; the next run shows whether the stored app password still works.
+- Use a separate app password per monitoring host. Copies of the same file on two
+  hosts break as soon as one of them rotates.
+
+`rotate` exits `0` when it rotated, `2` when the outcome is uncertain or the
+new app password does not work, and `3` when nothing was rotated (rejected app
+password, missing permission, unwritable directory, another rotation running).
 
 ## Thresholds
 
