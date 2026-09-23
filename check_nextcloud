@@ -26,7 +26,7 @@ UNKNOWN = 3
 
 STATE_TEXT = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
 
-VERSION = "0.2"
+VERSION = "0.3"
 DEFAULT_PORT = 443
 DEFAULT_USER = "admin"
 DEFAULT_TIMEOUT = 10
@@ -492,14 +492,23 @@ MODES = {
 }
 
 
+class ArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error, which Nagios reads as CRITICAL; exit UNKNOWN instead."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("%s: error: %s\n" % (self.prog, message))
+        sys.exit(UNKNOWN)
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(
+    parser = ArgumentParser(
         prog="check_nextcloud",
         description="Nagios/Icinga plugin to check a Nextcloud instance.",
     )
     parser.add_argument("-V", "--version", action="version", version="check_nextcloud %s" % VERSION)
 
-    connection = argparse.ArgumentParser(add_help=False)
+    connection = ArgumentParser(add_help=False)
     connection.add_argument("-H", "--hostname", required=True, help="host name or address of the Nextcloud server")
     connection.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
                         help="port of the Nextcloud server (default: %d)" % DEFAULT_PORT)
@@ -511,7 +520,7 @@ def build_parser():
                         help="timeout in seconds (default: %d)" % DEFAULT_TIMEOUT)
     connection.add_argument("-u", "--username", default=DEFAULT_USER,
                         help="user the app password belongs to (default: %s)" % DEFAULT_USER)
-    check = argparse.ArgumentParser(add_help=False)
+    check = ArgumentParser(add_help=False)
     check.add_argument("-P", "--password", help="app password; visible in the process list, prefer -f")
     check.add_argument("-f", "--password-file", help="file holding the app password")
     check.add_argument("-w", "--warning", help="warning threshold as a range")

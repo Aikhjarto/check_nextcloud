@@ -122,3 +122,5 @@ NEXTCLOUD MEMORY OK - 42.5% of the memory used (1.2 GiB of 2.8 GiB), swap 6.0% u
 `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN. An unreachable server, an
 uninstalled instance and a pending database upgrade are CRITICAL; maintenance
 mode is WARNING; rejected credentials and unparsable answers are UNKNOWN.
+So is a wrong command line, which argparse alone would report with exit code 2,
+i.e. CRITICAL.
