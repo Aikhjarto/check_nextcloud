@@ -1,0 +1,439 @@
+#!/usr/bin/python3
+# Nagios/Icinga plugin to check a Nextcloud instance via status.php and the
+# REST API of the serverinfo app.
+#
+# Copyright (c) 2026 Thomas Wagner <wagner-thomas@gmx.at>
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+import argparse
+import base64
+import json
+import os
+import socket
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+
+OK = 0
+WARNING = 1
+CRITICAL = 2
+UNKNOWN = 3
+
+STATE_TEXT = {OK: "OK", WARNING: "WARNING", CRITICAL: "CRITICAL", UNKNOWN: "UNKNOWN"}
+
+VERSION = "0.1"
+DEFAULT_PORT = 443
+DEFAULT_USER = "admin"
+DEFAULT_TIMEOUT = 10
+
+SERVERINFO_PATH = "/ocs/v2.php/apps/serverinfo/api/v1/info"
+
+
+class PluginError(Exception):
+    def __init__(self, state, message):
+        super().__init__(message)
+        self.state = state
+        self.message = message
+
+
+class Range:
+    """Threshold range as defined by the monitoring plugins guidelines."""
+
+    def __init__(self, start, end, inside):
+        self.start = start
+        self.end = end
+        self.inside = inside
+        self.spec = self._normalized()
+
+    def _normalized(self):
+        """Range as perfdata carries it: same unit as the value, no size suffixes."""
+        if self.start == 0 and self.end != float("inf"):
+            body = format_number(self.end)
+        else:
+            low = "~" if self.start == float("-inf") else format_number(self.start)
+            high = "" if self.end == float("inf") else format_number(self.end)
+            body = "%s:%s" % (low, high)
+        return ("@" if self.inside else "") + body
+
+    @classmethod
+    def parse(cls, spec, parse_value=float):
+        raw = spec
+        inside = spec.startswith("@")
+        if inside:
+            spec = spec[1:]
+
+        if ":" in spec:
+            low, high = spec.split(":", 1)
+        else:
+            low, high = "0", spec
+
+        try:
+            start = float("-inf") if low in ("~", "") else parse_value(low)
+            end = float("inf") if high == "" else parse_value(high)
+        except ValueError:
+            raise PluginError(UNKNOWN, "invalid threshold %r" % raw)
+
+        if start > end:
+            raise PluginError(UNKNOWN, "invalid threshold %r: start is above end" % raw)
+
+        return cls(start, end, inside)
+
+    def breached(self, value):
+        within = self.start <= value <= self.end
+        return within if self.inside else not within
+
+
+def parse_size(text):
+    """Parse a byte size, optionally suffixed with K, M, G, T or P."""
+    factors = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5}
+    text = text.strip()
+    if text and text[-1].upper() in factors:
+        return float(text[:-1]) * factors[text[-1].upper()]
+    return float(text)
+
+
+def human_bytes(value):
+    value = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024 or unit == "TiB":
+            return "%d %s" % (value, unit) if unit == "B" else "%.1f %s" % (value, unit)
+        value /= 1024
+
+
+def format_number(value):
+    if isinstance(value, int) or float(value).is_integer():
+        return "%d" % value
+    return ("%.3f" % value).rstrip("0").rstrip(".")
+
+
+def perfdata(label, value, uom="", warn=None, crit=None, minimum=None, maximum=None):
+    fields = [
+        warn.spec if warn else "",
+        crit.spec if crit else "",
+        "" if minimum is None else format_number(minimum),
+        "" if maximum is None else format_number(maximum),
+    ]
+    while fields and fields[-1] == "":
+        fields.pop()
+    out = "%s=%s%s" % (label, format_number(value), uom)
+    if fields:
+        out += ";" + ";".join(fields)
+    return out
+
+
+def read_password(args):
+    if args.password:
+        return args.password.strip()
+
+    path = args.password_file or os.environ.get("NEXTCLOUD_APP_PASSWORD_FILE")
+    if path:
+        try:
+            with open(os.path.expanduser(path), "r") as handle:
+                return handle.read().strip()
+        except OSError as err:
+            raise PluginError(UNKNOWN, "cannot read password file: %s" % err)
+
+    password = os.environ.get("NEXTCLOUD_APP_PASSWORD")
+    if password:
+        return password.strip()
+
+    raise PluginError(UNKNOWN, "no app password given, use -P, -f or $NEXTCLOUD_APP_PASSWORD")
+
+
+def http_get(args, path, authenticate=False):
+    scheme = "https" if args.ssl else "http"
+    url = "%s://%s:%d%s" % (scheme, args.hostname, args.port, path)
+
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    if authenticate:
+        request.add_header("OCS-APIRequest", "true")
+        credentials = "%s:%s" % (args.username, read_password(args))
+        encoded = base64.b64encode(credentials.encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", "Basic %s" % encoded)
+
+    context = None
+    if args.ssl:
+        context = ssl.create_default_context()
+        if args.insecure:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout, context=context) as response:
+            body = response.read()
+    except urllib.error.HTTPError as err:
+        if err.code in (401, 403):
+            raise PluginError(UNKNOWN, "credentials rejected for %s (HTTP %d)" % (path, err.code))
+        if err.code >= 500:
+            raise PluginError(CRITICAL, "server error on %s (HTTP %d)" % (path, err.code))
+        raise PluginError(UNKNOWN, "unexpected HTTP %d on %s" % (err.code, path))
+    except urllib.error.URLError as err:
+        raise PluginError(CRITICAL, "cannot reach %s: %s" % (url, err.reason))
+    except socket.timeout:
+        raise PluginError(CRITICAL, "timeout after %gs while reading %s" % (args.timeout, url))
+    elapsed = time.monotonic() - started
+
+    try:
+        return json.loads(body.decode("utf-8")), elapsed
+    except (UnicodeDecodeError, ValueError):
+        raise PluginError(UNKNOWN, "no valid JSON returned by %s, is this a Nextcloud server?" % path)
+
+
+def serverinfo(args, with_apps=False):
+    path = "%s?format=json&skipApps=%s" % (SERVERINFO_PATH, "false" if with_apps else "true")
+    answer, _ = http_get(args, path, authenticate=True)
+
+    try:
+        meta = answer["ocs"]["meta"]
+        data = answer["ocs"]["data"]
+    except (KeyError, TypeError):
+        raise PluginError(UNKNOWN, "unexpected answer from the serverinfo app")
+
+    status = int(meta.get("statuscode", 0))
+    if status not in (100, 200):
+        if status in (401, 403, 997):
+            raise PluginError(UNKNOWN, "credentials rejected by the serverinfo app (status %d)" % status)
+        raise PluginError(UNKNOWN, "serverinfo app returned status %d: %s" % (status, meta.get("message", "")))
+
+    return data
+
+
+def pick(data, *keys):
+    node = data
+    for key in keys:
+        try:
+            node = node[key]
+        except (KeyError, TypeError, IndexError):
+            raise PluginError(UNKNOWN, "value %r missing in the serverinfo answer" % "/".join(map(str, keys)))
+    return node
+
+
+def evaluate(args, value):
+    if args.critical and args.critical.breached(value):
+        return CRITICAL
+    if args.warning and args.warning.breached(value):
+        return WARNING
+    return OK
+
+
+def check_health(args):
+    data, elapsed = http_get(args, "/status.php")
+
+    if not data.get("installed"):
+        raise PluginError(CRITICAL, "Nextcloud reports that it is not installed")
+    if data.get("needsDbUpgrade"):
+        raise PluginError(CRITICAL, "Nextcloud needs a database upgrade")
+
+    state = evaluate(args, elapsed)
+    message = "%s %s answered in %.3fs" % (
+        data.get("productname", "Nextcloud"),
+        data.get("versionstring", "?"),
+        elapsed,
+    )
+    if data.get("maintenance"):
+        state = max(state, WARNING)
+        message += ", maintenance mode is on"
+
+    perf = [perfdata("time", round(elapsed, 3), "s", args.warning, args.critical, 0)]
+    return state, message, perf
+
+
+def check_cpu(args):
+    data = serverinfo(args)
+    load = pick(data, "nextcloud", "system", "cpuload")
+    if not isinstance(load, list) or len(load) < 3:
+        raise PluginError(UNKNOWN, "no load average reported by the serverinfo app")
+    load1, load5, load15 = (float(value) for value in load[:3])
+    cpus = int(pick(data, "nextcloud", "system", "cpunum"))
+
+    state = evaluate(args, load1)
+    message = "load average %.2f %.2f %.2f on %d CPUs" % (load1, load5, load15, cpus)
+    perf = [
+        perfdata("load1", round(load1, 3), "", args.warning, args.critical, 0),
+        perfdata("load5", round(load5, 3), "", None, None, 0),
+        perfdata("load15", round(load15, 3), "", None, None, 0),
+        perfdata("cpus", cpus, "", None, None, 0),
+    ]
+    return state, message, perf
+
+
+def check_memory(args):
+    system = pick(serverinfo(args), "nextcloud", "system")
+
+    total = int(system["mem_total"]) * 1024
+    free = int(system["mem_free"]) * 1024
+    swap_total = int(system["swap_total"]) * 1024
+    swap_free = int(system["swap_free"]) * 1024
+
+    if total <= 0:
+        raise PluginError(UNKNOWN, "the serverinfo app reports no memory size")
+
+    used = total - free
+    usage = 100.0 * used / total
+    swap_usage = 100.0 * (swap_total - swap_free) / swap_total if swap_total > 0 else 0.0
+
+    state = evaluate(args, usage)
+    message = "%.1f%% of the memory used (%s of %s), swap %.1f%% used" % (
+        usage, human_bytes(used), human_bytes(total), swap_usage,
+    )
+    perf = [
+        perfdata("usage", round(usage, 2), "%", args.warning, args.critical, 0, 100),
+        perfdata("used", used, "B", None, None, 0, total),
+        perfdata("swap_usage", round(swap_usage, 2), "%", None, None, 0, 100),
+        perfdata("swap_used", swap_total - swap_free, "B", None, None, 0, swap_total),
+    ]
+    return state, message, perf
+
+
+def check_freespace(args):
+    free = int(pick(serverinfo(args), "nextcloud", "system", "freespace"))
+
+    state = evaluate(args, free)
+    message = "%s free in the data directory" % human_bytes(free)
+    perf = [perfdata("free", free, "B", args.warning, args.critical, 0)]
+    return state, message, perf
+
+
+def check_storage(args):
+    data = serverinfo(args)
+    storage = pick(data, "nextcloud", "storage")
+    shares = pick(data, "nextcloud", "shares")
+
+    files = int(storage["num_files"])
+    users = int(storage["num_users"])
+
+    state = evaluate(args, files)
+    message = "%d files of %d users in %d storages, database %s" % (
+        files, users, int(storage["num_storages"]), human_bytes(pick(data, "server", "database", "size")),
+    )
+    perf = [
+        perfdata("files", files, "", args.warning, args.critical, 0),
+        perfdata("users", users, "", None, None, 0),
+        perfdata("disabled_users", int(storage.get("num_disabled_users", 0)), "", None, None, 0),
+        perfdata("storages", int(storage["num_storages"]), "", None, None, 0),
+        perfdata("shares", int(shares["num_shares"]), "", None, None, 0),
+        perfdata("shares_link_no_password", int(shares.get("num_shares_link_no_password", 0)), "", None, None, 0),
+        perfdata("appdata_size", int(storage.get("size_appdata_storage", 0)), "B", None, None, 0),
+        perfdata("database_size", int(pick(data, "server", "database", "size")), "B", None, None, 0),
+    ]
+    return state, message, perf
+
+
+def check_users(args):
+    data = serverinfo(args)
+    active = pick(data, "activeUsers")
+    total = int(pick(data, "nextcloud", "storage", "num_users"))
+
+    last24 = int(active["last24hours"])
+    state = evaluate(args, last24)
+    message = "%d of %d users active in the last 24 hours (%d in the last hour, %d in the last 5 minutes)" % (
+        last24, total, int(active["last1hour"]), int(active["last5minutes"]),
+    )
+    perf = [
+        perfdata("active24h", last24, "", args.warning, args.critical, 0, total),
+        perfdata("active1h", int(active["last1hour"]), "", None, None, 0, total),
+        perfdata("active5m", int(active["last5minutes"]), "", None, None, 0, total),
+        perfdata("active7d", int(active.get("last7days", 0)), "", None, None, 0, total),
+        perfdata("users", total, "", None, None, 0),
+    ]
+    return state, message, perf
+
+
+def check_apps(args):
+    apps = pick(serverinfo(args, with_apps=True), "nextcloud", "system", "apps")
+
+    installed = int(apps["num_installed"])
+    updates = int(apps["num_updates_available"])
+
+    state = evaluate(args, updates)
+    message = "%d of %d apps have an update available" % (updates, installed)
+    names = sorted(apps.get("app_updates") or {})
+    if names:
+        message += ": %s" % ", ".join(names)
+
+    perf = [
+        perfdata("updates", updates, "", args.warning, args.critical, 0, installed),
+        perfdata("installed", installed, "", None, None, 0),
+    ]
+    return state, message, perf
+
+
+MODES = {
+    "health": (check_health, "check status.php for an installed and running instance", float, None, None),
+    "cpu": (check_cpu, "check the load average of the server", float, None, None),
+    "memory": (check_memory, "check the memory usage of the server", float, "90", "95"),
+    "freespace": (check_freespace, "check the free space of the data directory", parse_size, "20G:", "5G:"),
+    "storage": (check_storage, "report files, users, storages and database size", float, None, None),
+    "users": (check_users, "report the number of active users", float, None, None),
+    "apps": (check_apps, "check for available app updates", float, "0", None),
+}
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="check_nextcloud",
+        description="Nagios/Icinga plugin to check a Nextcloud instance.",
+    )
+    parser.add_argument("-V", "--version", action="version", version="check_nextcloud %s" % VERSION)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-H", "--hostname", required=True, help="host name or address of the Nextcloud server")
+    common.add_argument("-p", "--port", type=int, default=DEFAULT_PORT,
+                        help="port of the Nextcloud server (default: %d)" % DEFAULT_PORT)
+    common.add_argument("-S", "--ssl", dest="ssl", action="store_true", default=True,
+                        help="use HTTPS (default)")
+    common.add_argument("--no-ssl", dest="ssl", action="store_false", help="use plain HTTP")
+    common.add_argument("-k", "--insecure", action="store_true", help="do not verify the TLS certificate")
+    common.add_argument("-t", "--timeout", type=float, default=DEFAULT_TIMEOUT,
+                        help="timeout in seconds (default: %d)" % DEFAULT_TIMEOUT)
+    common.add_argument("-u", "--username", default=DEFAULT_USER,
+                        help="user the app password belongs to (default: %s)" % DEFAULT_USER)
+    common.add_argument("-P", "--password", help="app password; visible in the process list, prefer -f")
+    common.add_argument("-f", "--password-file", help="file holding the app password")
+    common.add_argument("-w", "--warning", help="warning threshold as a range")
+    common.add_argument("-c", "--critical", help="critical threshold as a range")
+
+    subparsers = parser.add_subparsers(dest="mode", required=True, metavar="MODE")
+    for name, (_, description, _, warning, critical) in sorted(MODES.items()):
+        defaults = []
+        if warning:
+            defaults.append("-w %s" % warning)
+        if critical:
+            defaults.append("-c %s" % critical)
+        help_text = description
+        if defaults:
+            help_text += " (defaults to %s)" % " ".join(defaults)
+        subparsers.add_parser(name, parents=[common], help=help_text, description=help_text)
+
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    handler, _, parse_value, default_warning, default_critical = MODES[args.mode]
+    warning = args.warning if args.warning is not None else default_warning
+    critical = args.critical if args.critical is not None else default_critical
+
+    try:
+        args.warning = Range.parse(warning, parse_value) if warning else None
+        args.critical = Range.parse(critical, parse_value) if critical else None
+        state, message, perf = handler(args)
+    except (KeyError, TypeError, ValueError, IndexError) as err:
+        print("NEXTCLOUD %s UNKNOWN - unexpected answer from the server: %r" % (args.mode.upper(), err))
+        return UNKNOWN
+    except PluginError as err:
+        print("NEXTCLOUD %s %s - %s" % (args.mode.upper(), STATE_TEXT[err.state], err.message))
+        return err.state
+
+    print("NEXTCLOUD %s %s - %s | %s" % (args.mode.upper(), STATE_TEXT[state], message, " ".join(perf)))
+    return state
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(UNKNOWN)
