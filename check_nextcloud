@@ -51,7 +51,13 @@ class Range:
         self.spec = self._normalized()
 
     def _normalized(self):
-        """Range as perfdata carries it: same unit as the value, no size suffixes."""
+        """Threshold as perfdata carries it: graphers want a plain number, so one-sided ranges become their bound."""
+        if not self.inside and self.start == float("-inf") and self.end == float("inf"):
+            return ""
+        if not self.inside and self.end == float("inf"):
+            return format_number(self.start)
+        if not self.inside and self.start in (0, float("-inf")) and self.end != float("inf"):
+            return format_number(self.end)
         if self.start == 0 and self.end != float("inf"):
             body = format_number(self.end)
         else:
