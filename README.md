@@ -104,12 +104,15 @@ password, missing permission, unwritable directory, another rotation running).
 
 `-w` and `-c` take a range as defined by the
 [monitoring plugins guidelines](https://www.monitoring-plugins.org/doc/guidelines.html#THRESHOLDFORMAT):
-`10` alerts outside 0..10, `10:` below 10, `~:10` above 10, `10:20` outside
+`10` alerts outside 0..10, `10:` below 10, `'~:10'` above 10, `10:20` outside
 10..20, and `@10:20` inside 10..20.
+
+Quote a range with `~` on the command line, as shown: bash expands an
+unquoted `~:10` to your home directory followed by `:10`.
 
 Byte thresholds accept the suffixes `K`, `M`, `G`, `T` and `P`. Free space is
 checked with a lower bound, so `-w 20G:` warns once less than 20 GiB are left.
-Modes with a default threshold still accept `-w ~:` to switch the alert off.
+Modes with a default threshold still accept `-w '~:'` to switch the alert off.
 
 ## Performance data
 
