@@ -127,3 +127,19 @@ uninstalled instance and a pending database upgrade are CRITICAL; maintenance
 mode is WARNING; rejected credentials and unparsable answers are UNKNOWN.
 So is a wrong command line, which argparse alone would report with exit code 2,
 i.e. CRITICAL.
+
+## Bash completion
+
+`completions/check_nextcloud` completes the modes, the options of each mode and
+their values, also when the plugin is called by its full path. The packages
+install it; otherwise copy it to bash-completion's directory:
+
+```sh
+install -D -m 0644 completions/check_nextcloud /usr/share/bash-completion/completions/check_nextcloud
+```
+
+## Tests
+
+```sh
+python3 -m unittest -v
+```

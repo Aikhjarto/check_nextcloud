@@ -1,0 +1,61 @@
+# bash completion for check_nextcloud                        -*- shell-script -*-
+
+_check_nextcloud()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    # --option=value: bash splits at the =
+    if [[ $cur == = ]]; then
+        cur=
+    elif [[ $prev == = && $COMP_CWORD -ge 2 ]]; then
+        prev=${COMP_WORDS[COMP_CWORD-2]}
+    fi
+    COMPREPLY=()
+
+    case $prev in
+        -H | --hostname)
+            mapfile -t COMPREPLY < <(compgen -A hostname -- "$cur")
+            return
+            ;;
+        -f | --password-file)
+            compopt -o filenames 2>/dev/null
+            mapfile -t COMPREPLY < <(compgen -f -- "$cur")
+            return
+            ;;
+        -p | --port | -t | --timeout | -u | --username | -P | --password | -w | --warning | \
+            -c | --critical)
+            return
+            ;;
+    esac
+
+    # the mode is the first word that is not an option; the options before
+    # it take no value
+    local i mode=
+    for ((i = 1; i < COMP_CWORD; i++)); do
+        if [[ ${COMP_WORDS[i]} != -* ]]; then
+            mode=${COMP_WORDS[i]}
+            break
+        fi
+    done
+
+    local options
+    case $mode in
+        '')
+            options='-h --help -V --version apps cpu freespace health memory storage users
+                rotate'
+            ;;
+        apps | cpu | freespace | health | memory | storage | users)
+            options='-h --help -H --hostname -p --port -S --ssl --no-ssl -k --insecure
+                -t --timeout -u --username -P --password -f --password-file
+                -w --warning -c --critical'
+            ;;
+        rotate)
+            options='-h --help -H --hostname -p --port -S --ssl --no-ssl -k --insecure
+                -t --timeout -u --username -f --password-file'
+            ;;
+        *)
+            return
+            ;;
+    esac
+    mapfile -t COMPREPLY < <(compgen -W "$options" -- "$cur")
+}
+complete -F _check_nextcloud check_nextcloud
